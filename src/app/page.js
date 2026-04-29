@@ -433,7 +433,12 @@ const S3ObjectStorage = () => {
           <div style={{ width: 8, height: 8, borderRadius: '50%', background: connected ? 'var(--accent)' : 'var(--text-muted)', boxShadow: connected ? '0 0 8px var(--accent)' : 'none', animation: loading ? 'pulse 1s infinite' : 'none' }} />
           <span style={{ fontFamily: 'var(--font-display)', fontSize: 18, fontWeight: 700, letterSpacing: -0.5, color: 'var(--text)' }}>Object Storage</span>
           <span style={{ color: 'var(--text-muted)', fontSize: 11, marginLeft: 4, fontFamily: 'var(--font-mono)' }}>S3-compatible explorer</span>
-          {connected && <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--accent)', border: '1px solid var(--accent)', borderRadius: 4, padding: '2px 8px' }}>● CONNECTED</span>}
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+            <a href="/ipsec-troubleshooter" style={{ color: 'var(--text-muted)', textDecoration: 'none', fontSize: 13, padding: '4px 8px', borderRadius: 4, border: '1px solid var(--border)', transition: 'all 0.2s' }} onMouseOver={(e) => e.target.style.borderColor = 'var(--accent)'} onMouseOut={(e) => e.target.style.borderColor = 'var(--border)'}>
+              🔐 IPSec Troubleshooter
+            </a>
+            {connected && <span style={{ fontSize: 11, color: 'var(--accent)', border: '1px solid var(--accent)', borderRadius: 4, padding: '2px 8px' }}>● CONNECTED</span>}
+          </div>
         </div>
 
         <div style={{ maxWidth: 1100, margin: '0 auto', padding: '24px 16px' }}>
