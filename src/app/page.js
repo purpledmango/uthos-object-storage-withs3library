@@ -91,6 +91,11 @@ const S3ObjectStorage = () => {
   const [selectedKeys, setSelectedKeys] = useState(new Set());
   const [contextMenu, setContextMenu] = useState(null); // {x, y, item}
   const [modal, setModal] = useState(null); // {type, data}
+  const [fieldErrors, setFieldErrors] = useState({});
+  const [connectionError, setConnectionError] = useState(null);
+  const [fileVersions, setFileVersions] = useState({});
+  const [selectedFileVersions, setSelectedFileVersions] = useState(null);
+  const [fileVersionList, setFileVersionList] = useState([]);
   const fileInputRef = useRef();
 
   const toast = (msg, type = 'info') => {
@@ -110,21 +115,58 @@ const S3ObjectStorage = () => {
   });
 
   // ── Connection ──────────────────────────────────────────────────────────────
+  const validateFields = () => {
+    const errors = {};
+    if (!config.endpoint?.trim()) errors.endpoint = 'Endpoint URL is required (e.g., https://s3.example.com)';
+    else if (!config.endpoint.startsWith('http')) errors.endpoint = 'Endpoint must start with http:// or https://';
+    if (!config.bucketName?.trim()) errors.bucketName = 'Bucket name is required';
+    if (!config.accessKey?.trim()) errors.accessKey = 'Access key is required';
+    if (!config.secretKey?.trim()) errors.secretKey = 'Secret key is required';
+    if (!config.region?.trim()) errors.region = 'Region is required';
+    return errors;
+  };
+
   const connectToS3 = async () => {
-    if (!config.endpoint || !config.bucketName || !config.accessKey || !config.secretKey) {
-      toast('Please fill in all connection details', 'error'); return;
+    const errors = validateFields();
+    setFieldErrors(errors);
+    setConnectionError(null);
+    
+    if (Object.keys(errors).length > 0) {
+      toast('Please fill in all fields correctly', 'error');
+      return;
     }
+    
     try {
       setLoading(true);
       const AWS = await loadAWS();
       AWS.config.update({ accessKeyId: config.accessKey, secretAccessKey: config.secretKey, region: config.region });
       const s3 = new AWS.S3({ endpoint: config.endpoint, s3ForcePathStyle: true, signatureVersion: 'v4' });
+      
       await new Promise((res, rej) => s3.headBucket({ Bucket: config.bucketName }, (e, d) => e ? rej(e) : res(d)));
       setS3Client(s3);
       setConnected(true);
+      setFieldErrors({});
       toast('Connected successfully!', 'success');
       await listObjects(s3, '');
-    } catch (e) { toast(`Connection failed: ${e.message}`, 'error'); }
+    } catch (e) {
+      const errorMsg = e.message || e.code || 'Unknown error';
+      let detailedError = `Connection failed: ${errorMsg}`;
+      
+      if (errorMsg.includes('Forbidden')) {
+        detailedError = '❌ Access Denied: Invalid access key or secret key';
+      } else if (errorMsg.includes('NoSuchBucket')) {
+        detailedError = '❌ Bucket Not Found: Bucket does not exist or is in a different region';
+      } else if (errorMsg.includes('NetworkingError') || errorMsg.includes('ENOTFOUND')) {
+        detailedError = '❌ Network Error: Cannot reach endpoint URL. Check endpoint and network connection';
+      } else if (errorMsg.includes('InvalidSignature')) {
+        detailedError = '❌ Invalid Credentials: Access key or secret key is incorrect';
+      } else if (errorMsg.includes('request timed out')) {
+        detailedError = '❌ Connection Timeout: Endpoint took too long to respond. Check endpoint URL';
+      }
+      
+      setConnectionError(detailedError);
+      toast(detailedError, 'error');
+    }
     finally { setLoading(false); }
   };
 
@@ -144,10 +186,108 @@ const S3ObjectStorage = () => {
         token = data.NextContinuationToken;
       } while (token);
       setAllObjects(all.map(i => ({ key: i.Key, size: i.Size, lastModified: i.LastModified })));
+      
+      // Check for versions (S3 versioning)
+      const versions = {};
+      try {
+        let keyMarker = undefined;
+        let versionIdMarker = undefined;
+        let totalVersions = 0;
+        do {
+          const vParams = { 
+            Bucket: config.bucketName, 
+            MaxKeys: 1000,
+            ...(keyMarker ? { KeyMarker: keyMarker, VersionIdMarker: versionIdMarker } : {})
+          };
+          const vData = await new Promise((res, rej) => s3.listObjectVersions(vParams, (e, d) => e ? rej(e) : res(d)));
+          (vData.Versions || []).forEach(v => {
+            versions[v.Key] = (versions[v.Key] || 0) + 1;
+            totalVersions++;
+          });
+          keyMarker = vData.NextKeyMarker;
+          versionIdMarker = vData.NextVersionIdMarker;
+        } while (keyMarker);
+        setFileVersions(versions);
+        console.log(`Versioning enabled: ${totalVersions} total versions found`, versions);
+      } catch (e) {
+        // Versioning not enabled, that's ok
+        console.log('Versioning not enabled or error fetching versions:', e.message);
+        setFileVersions({});
+      }
+      
       if (pfx !== undefined) setPrefix(pfx);
       toast(`Loaded ${all.length} objects`, 'success');
     } catch (e) { toast(`List failed: ${e.message}`, 'error'); }
     finally { setLoading(false); }
+  };
+
+  // ── View File Versions ──────────────────────────────────────────────────────
+  const viewFileVersions = async (key) => {
+    if (!s3Client) return;
+    try {
+      setLoading(true);
+      const allVersions = [];
+      let keyMarker = undefined;
+      let versionIdMarker = undefined;
+      
+      do {
+        const vParams = {
+          Bucket: config.bucketName,
+          MaxKeys: 1000,
+          ...(keyMarker ? { KeyMarker: keyMarker, VersionIdMarker: versionIdMarker } : {})
+        };
+        const vData = await new Promise((res, rej) => s3Client.listObjectVersions(vParams, (e, d) => e ? rej(e) : res(d)));
+        (vData.Versions || []).forEach(v => {
+          if (v.Key === key) {
+            allVersions.push({
+              versionId: v.VersionId,
+              lastModified: v.LastModified,
+              size: v.Size,
+              isLatest: v.IsLatest,
+              etag: v.ETag
+            });
+          }
+        });
+        keyMarker = vData.NextKeyMarker;
+        versionIdMarker = vData.NextVersionIdMarker;
+      } while (keyMarker);
+      
+      if (allVersions.length === 0) {
+        toast('No versions found. Versioning may not be enabled on this bucket.', 'warn');
+      }
+      
+      setFileVersionList(allVersions.sort((a, b) => new Date(b.lastModified) - new Date(a.lastModified)));
+      setSelectedFileVersions(key);
+    } catch (e) {
+      toast(`Failed to fetch versions: ${e.message}`, 'error');
+      console.error('Version fetch error:', e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Download File Version ───────────────────────────────────────────────────
+  const downloadFileVersion = async (key, versionId) => {
+    if (!s3Client) return;
+    try {
+      setLoading(true);
+      const data = await new Promise((res, rej) => s3Client.getObject({ Bucket: config.bucketName, Key: key, VersionId: versionId }, (e, d) => e ? rej(e) : res(d)));
+      const blob = new Blob([data.Body], { type: data.ContentType });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const fileName = key.split('/').pop();
+      const versionStr = versionId === 'null' ? '' : `_v${versionId.slice(0, 8)}`;
+      a.download = `${fileName}${versionStr}`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast(`Downloaded version of ${fileName}`, 'success');
+    } catch (e) {
+      toast(`Download failed: ${e.message}`, 'error');
+      console.error('Version download error:', e);
+    } finally {
+      setLoading(false);
+    }
   };
 
   // ── Derive current view ─────────────────────────────────────────────────────
@@ -348,8 +488,8 @@ const S3ObjectStorage = () => {
     .btn-ghost:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
     .btn-danger { background: #3d1a1a; color: var(--danger); border: 1px solid #5a1a1a; }
     .btn-danger:hover:not(:disabled) { background: #5a1a1a; }
-    .input { background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 9px 12px; font-size: 13px; font-family: var(--font-mono); width: 100%; transition: border-color 0.15s; outline: none; }
-    .input:focus { border-color: var(--accent); }
+    .input { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 8px 12px; font-size: 13px; font-family: var(--font-mono); width: 100%; transition: all 0.2s; outline: none; }
+    .input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(77,255,180,0.1); }
     .input:disabled { opacity: 0.4; }
     .checkbox { accent-color: var(--accent); cursor: pointer; width: 14px; height: 14px; }
     .cm-item { padding: 8px 14px; cursor: pointer; font-size: 12px; display: flex; align-items: center; gap: 8px; color: var(--text); }
@@ -375,9 +515,10 @@ const S3ObjectStorage = () => {
           minWidth: 180, boxShadow: '0 8px 32px rgba(0,0,0,0.5)', animation: 'fadeUp 0.1s ease',
         }}>
           {!contextMenu.item.isFolder && <div className="cm-item" onClick={() => { downloadObject(contextMenu.item.key); setContextMenu(null); }}><Icon d={icons.download} size={14} />Download</div>}
+          {!contextMenu.item.isFolder && <div className="cm-item" onClick={() => { viewFileVersions(contextMenu.item.key); setContextMenu(null); }}><Icon d={icons.copy} size={14} />View Versions</div>}
           <div className="cm-item" onClick={() => { setModal({ type: 'rename', item: contextMenu.item }); setInputVal(contextMenu.item.name); setContextMenu(null); }}><Icon d={icons.edit} size={14} />Rename</div>
           {!contextMenu.item.isFolder && <div className="cm-item" onClick={() => { setModal({ type: 'move', item: contextMenu.item }); setInputVal(''); setContextMenu(null); }}><Icon d={icons.move} size={14} />Move</div>}
-          {!contextMenu.item.isFolder && <div className="cm-item" onClick={() => { copyUrl(contextMenu.item.key); setContextMenu(null); }}><Icon d={icons.link} size={14} />Copy URL</div>}
+          {!contextMenu.item.isFolder && <div className="cm-item" onClick={() => { copyUrl(contextMenu.item.key); setTimeout(() => setContextMenu(null), 100); }}><Icon d={icons.link} size={14} />Copy URL</div>}
           <div style={{ height: 1, background: 'var(--border)', margin: '4px 0' }} />
           <div className="cm-item cm-danger" onClick={() => { setModal({ type: 'delete', keys: [contextMenu.item.key] }); setContextMenu(null); }}><Icon d={icons.trash} size={14} color="var(--danger)" />Delete</div>
         </div>
@@ -426,6 +567,39 @@ const S3ObjectStorage = () => {
         </Modal>
       )}
 
+      {/* View Versions Modal */}
+      {selectedFileVersions && (
+        <Modal title="File Versions" onClose={() => { setSelectedFileVersions(null); setFileVersionList([]); }}>
+          <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12 }}>{selectedFileVersions.split('/').pop()} has {fileVersionList.length} version(s)</p>
+          <div style={{ maxHeight: 400, overflowY: 'auto', border: '1px solid var(--border)', borderRadius: 6 }}>
+            {fileVersionList.map((v, i) => (
+              <div key={v.versionId} style={{ padding: 12, borderBottom: i < fileVersionList.length - 1 ? '1px solid var(--border)' : 'none', background: v.isLatest ? 'rgba(77,255,180,0.05)' : 'transparent' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                  <div>
+                    <div style={{ fontSize: 12, color: 'var(--text)', fontWeight: v.isLatest ? 600 : 400 }}>
+                      Version {i + 1} {v.isLatest && <span style={{ color: 'var(--accent)', fontSize: 11, marginLeft: 8 }}>● Latest</span>}
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+                      {formatDate(v.lastModified)} • {formatBytes(v.size)}
+                    </div>
+                  </div>
+                  <button 
+                    className="btn btn-primary" 
+                    style={{ padding: '4px 12px' }} 
+                    onClick={() => downloadFileVersion(selectedFileVersions, v.versionId)}
+                  >
+                    <Icon d={icons.download} size={12} />Download
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 16, justifyContent: 'flex-end' }}>
+            <button className="btn btn-ghost" onClick={() => { setSelectedFileVersions(null); setFileVersionList([]); }}>Close</button>
+          </div>
+        </Modal>
+      )}
+
       {/* ── Main Layout ── */}
       <div style={{ minHeight: '100vh', background: 'var(--bg)', padding: '0' }}>
         {/* Header */}
@@ -434,9 +608,7 @@ const S3ObjectStorage = () => {
           <span style={{ fontFamily: 'var(--font-display)', fontSize: 18, fontWeight: 700, letterSpacing: -0.5, color: 'var(--text)' }}>Object Storage</span>
           <span style={{ color: 'var(--text-muted)', fontSize: 11, marginLeft: 4, fontFamily: 'var(--font-mono)' }}>S3-compatible explorer</span>
           <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
-            <a href="/ipsec-troubleshooter" style={{ color: 'var(--text-muted)', textDecoration: 'none', fontSize: 13, padding: '4px 8px', borderRadius: 4, border: '1px solid var(--border)', transition: 'all 0.2s' }} onMouseOver={(e) => e.target.style.borderColor = 'var(--accent)'} onMouseOut={(e) => e.target.style.borderColor = 'var(--border)'}>
-              🔐 IPSec Troubleshooter
-            </a>
+
             {connected && <span style={{ fontSize: 11, color: 'var(--accent)', border: '1px solid var(--accent)', borderRadius: 4, padding: '2px 8px' }}>● CONNECTED</span>}
           </div>
         </div>
@@ -446,6 +618,14 @@ const S3ObjectStorage = () => {
           {!connected && (
             <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: 24, marginBottom: 24, animation: 'fadeUp 0.3s ease' }}>
               <div style={{ fontSize: 11, color: 'var(--accent)', fontWeight: 600, letterSpacing: 2, textTransform: 'uppercase', marginBottom: 16 }}>Connection</div>
+              
+              {connectionError && (
+                <div style={{ background: '#3d1a1a', border: '1px solid #5a1a1a', color: '#ff6b6b', borderRadius: 8, padding: 12, marginBottom: 16, fontSize: 13 }}>
+                  <div style={{ fontWeight: 600, marginBottom: 4 }}>Connection Error</div>
+                  <div>{connectionError}</div>
+                </div>
+              )}
+              
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
                 {[
                   { name: 'endpoint', label: 'Endpoint URL', placeholder: 'https://s3.example.com', type: 'text' },
@@ -455,8 +635,24 @@ const S3ObjectStorage = () => {
                   { name: 'region', label: 'Region', placeholder: 'us-east-1', type: 'text' },
                 ].map(f => (
                   <div key={f.name} style={f.name === 'endpoint' ? { gridColumn: '1/-1' } : {}}>
-                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 5, textTransform: 'uppercase', letterSpacing: 1 }}>{f.label}</div>
-                    <input className="input" type={f.type} name={f.name} value={config[f.name]} onChange={e => setConfig(p => ({ ...p, [e.target.name]: e.target.value }))} placeholder={f.placeholder} />
+                    <div style={{ fontSize: 11, color: fieldErrors[f.name] ? '#ff6b6b' : 'var(--text-muted)', marginBottom: 5, textTransform: 'uppercase', letterSpacing: 1 }}>
+                      {f.label}
+                      {fieldErrors[f.name] && <span style={{ marginLeft: 8, color: '#ff6b6b' }}>⚠ {fieldErrors[f.name]}</span>}
+                    </div>
+                    <input 
+                      className="input" 
+                      type={f.type} 
+                      name={f.name} 
+                      value={config[f.name]} 
+                      onChange={e => {
+                        setConfig(p => ({ ...p, [e.target.name]: e.target.value }));
+                        if (fieldErrors[f.name]) {
+                          setFieldErrors(p => ({ ...p, [f.name]: '' }));
+                        }
+                      }} 
+                      placeholder={f.placeholder}
+                      style={{ borderColor: fieldErrors[f.name] ? '#c0392b' : 'var(--border)' }}
+                    />
                   </div>
                 ))}
               </div>
@@ -470,6 +666,18 @@ const S3ObjectStorage = () => {
 
           {connected && (
             <div style={{ animation: 'fadeUp 0.3s ease' }}>
+              {/* Versioning Info */}
+              {Object.keys(fileVersions).length === 0 && (
+                <div style={{ background: 'rgba(255, 180, 77, 0.1)', border: '1px solid #ffb84d', color: '#ffb84d', borderRadius: 8, padding: 10, marginBottom: 16, fontSize: 12 }}>
+                  <strong>ℹ Versioning:</strong> Enable S3 versioning on your bucket to track multiple versions of files. Currently showing only latest versions.
+                </div>
+              )}
+              {Object.keys(fileVersions).length > 0 && Object.values(fileVersions).some(v => v > 1) && (
+                <div style={{ background: 'rgba(77, 255, 180, 0.1)', border: '1px solid #4dffb4', color: '#4dffb4', borderRadius: 8, padding: 10, marginBottom: 16, fontSize: 12 }}>
+                  <strong>✓ Versioning:</strong> Enabled. {Object.values(fileVersions).reduce((a, b) => a + b, 0)} total versions detected.
+                </div>
+              )}
+              
               {/* Toolbar */}
               <div style={{ display: 'flex', gap: 8, marginBottom: 16, alignItems: 'center', flexWrap: 'wrap' }}>
                 {/* Search */}
@@ -521,11 +729,12 @@ const S3ObjectStorage = () => {
                 style={{ padding: 0, border: 'none', background: 'var(--surface)', borderRadius: 10, border: '1px solid var(--border)', overflow: 'hidden' }}
               >
                 {/* Table header */}
-                <div style={{ display: 'grid', gridTemplateColumns: '36px 1fr 100px 160px 140px', gap: 0, background: 'var(--surface2)', borderBottom: '1px solid var(--border)', padding: '8px 16px', fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 1 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '36px 1fr 100px 160px 120px 140px', gap: 0, background: 'var(--surface2)', borderBottom: '1px solid var(--border)', padding: '8px 16px', fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 1 }}>
                   <div><input type="checkbox" className="checkbox" checked={selectedKeys.size === currentItems.filter(i => !i.isFolder).length && currentItems.length > 0} onChange={e => { if (e.target.checked) setSelectedKeys(new Set(currentItems.filter(i => !i.isFolder).map(i => i.key))); else setSelectedKeys(new Set()); }} /></div>
                   <div>Name</div>
                   <div style={{ textAlign: 'right' }}>Size</div>
                   <div>Modified</div>
+                  <div>Versions</div>
                   <div style={{ textAlign: 'center' }}>Actions</div>
                 </div>
 
@@ -541,7 +750,7 @@ const S3ObjectStorage = () => {
                       className="row-hover"
                       onContextMenu={e => handleContextMenu(e, item)}
                       onDoubleClick={() => { if (item.isFolder) { setPrefix(item.key); setSelectedKeys(new Set()); } }}
-                      style={{ display: 'grid', gridTemplateColumns: '36px 1fr 100px 160px 140px', gap: 0, padding: '9px 16px', borderBottom: '1px solid var(--border)', alignItems: 'center', cursor: item.isFolder ? 'pointer' : 'default', background: selectedKeys.has(item.key) ? 'rgba(77,255,180,0.04)' : 'transparent', transition: 'background 0.1s' }}
+                      style={{ display: 'grid', gridTemplateColumns: '36px 1fr 100px 160px 120px 140px', gap: 0, padding: '9px 16px', borderBottom: '1px solid var(--border)', alignItems: 'center', cursor: item.isFolder ? 'pointer' : 'default', background: selectedKeys.has(item.key) ? 'rgba(77,255,180,0.04)' : 'transparent', transition: 'background 0.1s' }}
                     >
                       {/* Checkbox */}
                       <div onClick={e => e.stopPropagation()}>
@@ -564,11 +773,20 @@ const S3ObjectStorage = () => {
                       <div style={{ fontSize: 12, color: 'var(--text-muted)', textAlign: 'right' }}>{item.isFolder ? '—' : formatBytes(item.size)}</div>
                       {/* Date */}
                       <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{item.isFolder ? '—' : item.lastModified ? formatDate(item.lastModified) : '—'}</div>
+                      {/* Versions */}
+                      <div style={{ fontSize: 11, color: fileVersions[item.key] > 1 ? 'var(--warn)' : 'var(--text-muted)', fontWeight: fileVersions[item.key] > 1 ? 600 : 400, cursor: 'help' }} title={fileVersions[item.key] > 1 ? `${fileVersions[item.key]} versions available` : 'Enable S3 versioning to track multiple versions'}>
+                        {item.isFolder ? '—' : fileVersions[item.key] ? `${fileVersions[item.key]} versions` : '1 version'}
+                      </div>
                       {/* Actions */}
                       <div style={{ display: 'flex', gap: 4, justifyContent: 'center' }} onClick={e => e.stopPropagation()}>
                         {!item.isFolder && (
                           <button className="btn btn-ghost" style={{ padding: '4px 8px' }} title="Download" onClick={() => downloadObject(item.key)}>
                             <Icon d={icons.download} size={13} />
+                          </button>
+                        )}
+                        {!item.isFolder && (
+                          <button className="btn btn-ghost" style={{ padding: '4px 8px' }} title="View Versions" onClick={() => viewFileVersions(item.key)}>
+                            <Icon d={icons.copy} size={13} />
                           </button>
                         )}
                         <button className="btn btn-ghost" style={{ padding: '4px 8px' }} title="Rename" onClick={() => { setModal({ type: 'rename', item }); setInputVal(item.name); }}>
