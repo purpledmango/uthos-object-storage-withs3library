@@ -96,7 +96,42 @@ const S3ObjectStorage = () => {
   const [fileVersions, setFileVersions] = useState({});
   const [selectedFileVersions, setSelectedFileVersions] = useState(null);
   const [fileVersionList, setFileVersionList] = useState([]);
+  const [savedConnections, setSavedConnections] = useState([]);
+  const [connectionName, setConnectionName] = useState('');
+  const [showNewConnectionForm, setShowNewConnectionForm] = useState(false);
   const fileInputRef = useRef();
+
+  // Load saved connections and restore session on mount
+  useEffect(() => {
+    const saved = localStorage.getItem('s3_connections');
+    if (saved) {
+      try {
+        setSavedConnections(JSON.parse(saved));
+        console.log('📂 Loaded saved S3 connections from localStorage');
+      } catch (e) {
+        console.error('Failed to load saved connections:', e);
+      }
+    }
+    
+    // Attempt to restore session
+    try {
+      const session = sessionStorage.getItem('s3_session');
+      if (session) {
+        const { config: savedConfig } = JSON.parse(session);
+        setConfig(savedConfig);
+        console.log('✓ Session restored from sessionStorage');
+      }
+      
+      // Display connection logs if available
+      const logs = sessionStorage.getItem('s3_connection_logs');
+      if (logs) {
+        const parsedLogs = JSON.parse(logs);
+        console.log('📊 Connection logs available:', parsedLogs.length, 'entries');
+      }
+    } catch (e) {
+      console.error('Failed to restore session:', e);
+    }
+  }, []);
 
   const toast = (msg, type = 'info') => {
     const id = Date.now();
@@ -114,11 +149,85 @@ const S3ObjectStorage = () => {
     document.body.appendChild(s);
   });
 
+  // ── Saved Connections Management ─────────────────────────────────────────────
+  const saveConnection = () => {
+    if (!connectionName.trim()) {
+      toast('Please enter a connection name', 'error');
+      return;
+    }
+    if (connectionName.trim().length < 2) {
+      toast('Connection name must be at least 2 characters', 'error');
+      return;
+    }
+
+    const newConnection = { 
+      id: Date.now(), 
+      name: connectionName.trim(),
+      ...config 
+    };
+    
+    const existing = savedConnections.findIndex(c => c.name === connectionName.trim());
+    let updated;
+    if (existing >= 0) {
+      updated = [...savedConnections];
+      updated[existing] = newConnection;
+      toast(`Updated connection "${connectionName}"`, 'success');
+    } else {
+      updated = [...savedConnections, newConnection];
+      toast(`Saved connection "${connectionName}"`, 'success');
+    }
+    
+    setSavedConnections(updated);
+    localStorage.setItem('s3_connections', JSON.stringify(updated));
+    setConnectionName('');
+  };
+
+  const loadConnection = (connId) => {
+    const conn = savedConnections.find(c => c.id === connId);
+    if (conn) {
+      setConfig({ 
+        endpoint: conn.endpoint, 
+        bucketName: conn.bucketName, 
+        accessKey: conn.accessKey, 
+        secretKey: conn.secretKey, 
+        region: conn.region 
+      });
+      setFieldErrors({});
+      toast(`Loaded connection "${conn.name}"`, 'success');
+    }
+  };
+
+  const deleteConnection = (connId) => {
+    const conn = savedConnections.find(c => c.id === connId);
+    const updated = savedConnections.filter(c => c.id !== connId);
+    setSavedConnections(updated);
+    localStorage.setItem('s3_connections', JSON.stringify(updated));
+    toast(`Deleted connection "${conn.name}"`, 'success');
+  };
+
+  // ── Connection Logging ──────────────────────────────────────────────────────
+  const logConnection = (level, message, data = {}) => {
+    const timestamp = new Date().toISOString();
+    const log = { timestamp, level, message, ...data };
+    console.log(`[${timestamp}] [${level.toUpperCase()}] ${message}`, data);
+    
+    // Store logs in sessionStorage for debugging
+    try {
+      const existing = sessionStorage.getItem('s3_connection_logs') || '[]';
+      const logs = JSON.parse(existing);
+      logs.push(log);
+      if (logs.length > 100) logs.shift();
+      sessionStorage.setItem('s3_connection_logs', JSON.stringify(logs));
+    } catch (e) {
+      console.error('Failed to store connection log:', e);
+    }
+  };
+
   // ── Connection ──────────────────────────────────────────────────────────────
   const validateFields = () => {
     const errors = {};
     if (!config.endpoint?.trim()) errors.endpoint = 'Endpoint URL is required (e.g., https://s3.example.com)';
-    else if (!config.endpoint.startsWith('http')) errors.endpoint = 'Endpoint must start with http:// or https://';
+    else if (!config.endpoint.startsWith('https://')) errors.endpoint = '🔒 Endpoint MUST use HTTPS for security (https://)';
     if (!config.bucketName?.trim()) errors.bucketName = 'Bucket name is required';
     if (!config.accessKey?.trim()) errors.accessKey = 'Access key is required';
     if (!config.secretKey?.trim()) errors.secretKey = 'Secret key is required';
@@ -138,30 +247,72 @@ const S3ObjectStorage = () => {
     
     try {
       setLoading(true);
+      logConnection('info', 'Starting S3 connection attempt', { endpoint: config.endpoint, bucket: config.bucketName, region: config.region });
+      
       const AWS = await loadAWS();
-      AWS.config.update({ accessKeyId: config.accessKey, secretAccessKey: config.secretKey, region: config.region });
-      const s3 = new AWS.S3({ endpoint: config.endpoint, s3ForcePathStyle: true, signatureVersion: 'v4' });
+      logConnection('debug', 'AWS SDK loaded successfully');
+      
+      AWS.config.update({ 
+        accessKeyId: config.accessKey, 
+        secretAccessKey: config.secretKey, 
+        region: config.region 
+      });
+      logConnection('debug', 'AWS config updated with credentials', { region: config.region });
+      
+      const s3 = new AWS.S3({ 
+        endpoint: config.endpoint, 
+        s3ForcePathStyle: true, 
+        signatureVersion: 'v4',
+        maxRetries: 2,
+        httpOptions: { timeout: 5000 }
+      });
+      logConnection('debug', 'S3 client created with v4 signature');
       
       await new Promise((res, rej) => s3.headBucket({ Bucket: config.bucketName }, (e, d) => e ? rej(e) : res(d)));
+      logConnection('info', 'Bucket access verified successfully');
+      
       setS3Client(s3);
       setConnected(true);
+      setShowNewConnectionForm(false);
       setFieldErrors({});
-      toast('Connected successfully!', 'success');
+      
+      // Save session state
+      try {
+        sessionStorage.setItem('s3_session', JSON.stringify({ config, connectedAt: new Date().toISOString() }));
+        localStorage.setItem('s3_last_endpoint', config.endpoint);
+        logConnection('info', 'Session saved to sessionStorage');
+      } catch (e) {
+        logConnection('warn', 'Failed to save session state', { error: e.message });
+      }
+      
+      toast('✓ Connected successfully!', 'success');
+      logConnection('info', 'Connection successful');
       await listObjects(s3, '');
     } catch (e) {
       const errorMsg = e.message || e.code || 'Unknown error';
+      const errorDetails = { error: e.message, code: e.code, statusCode: e.statusCode };
+      logConnection('error', 'Connection failed', errorDetails);
+      
       let detailedError = `Connection failed: ${errorMsg}`;
       
-      if (errorMsg.includes('Forbidden')) {
-        detailedError = '❌ Access Denied: Invalid access key or secret key';
+      if (errorMsg.includes('Forbidden') || errorMsg.includes('403')) {
+        detailedError = '❌ Access Denied: Check that your access key and secret key are correct';
+        logConnection('error', 'Authentication failed - invalid credentials');
       } else if (errorMsg.includes('NoSuchBucket')) {
-        detailedError = '❌ Bucket Not Found: Bucket does not exist or is in a different region';
-      } else if (errorMsg.includes('NetworkingError') || errorMsg.includes('ENOTFOUND')) {
-        detailedError = '❌ Network Error: Cannot reach endpoint URL. Check endpoint and network connection';
+        detailedError = '❌ Bucket Not Found: Verify bucket name and region';
+        logConnection('error', 'Bucket does not exist or is inaccessible');
+      } else if (errorMsg.includes('NetworkingError') || errorMsg.includes('ENOTFOUND') || errorMsg.includes('ECONNREFUSED')) {
+        detailedError = '❌ Network Error: Cannot reach endpoint. Verify endpoint URL and HTTPS is accessible';
+        logConnection('error', 'Network connectivity issue', { endpoint: config.endpoint });
       } else if (errorMsg.includes('InvalidSignature')) {
-        detailedError = '❌ Invalid Credentials: Access key or secret key is incorrect';
-      } else if (errorMsg.includes('request timed out')) {
-        detailedError = '❌ Connection Timeout: Endpoint took too long to respond. Check endpoint URL';
+        detailedError = '❌ Invalid Signature: Credentials may be malformed or incorrect';
+        logConnection('error', 'Signature validation failed');
+      } else if (errorMsg.includes('request timed out') || errorMsg.includes('ETIMEDOUT')) {
+        detailedError = '❌ Connection Timeout: Endpoint not responding. Check network and endpoint';
+        logConnection('error', 'Connection timeout');
+      } else if (errorMsg.includes('SSL') || errorMsg.includes('certificate')) {
+        detailedError = '❌ SSL Certificate Error: The endpoint may have an invalid certificate';
+        logConnection('error', 'SSL/TLS certificate issue');
       }
       
       setConnectionError(detailedError);
@@ -170,7 +321,56 @@ const S3ObjectStorage = () => {
     finally { setLoading(false); }
   };
 
-  const disconnect = () => { setConnected(false); setObjects([]); setAllObjects([]); setS3Client(null); setPrefix(''); setSelectedKeys(new Set()); };
+  const disconnect = () => { 
+    setConnected(false); 
+    setAllObjects([]); 
+    setS3Client(null); 
+    setPrefix(''); 
+    setSelectedKeys(new Set());
+    setShowNewConnectionForm(false);
+    setConfig({ endpoint: '', bucketName: '', accessKey: '', secretKey: '', region: 'us-east-1' });
+    setConnectionName('');
+    setFieldErrors({});
+    setConnectionError(null);
+    
+    // Clear session storage
+    try {
+      sessionStorage.removeItem('s3_session');
+      console.log('🔐 Session cleared from sessionStorage');
+    } catch (e) {
+      console.error('Failed to clear session:', e);
+    }
+    
+    toast('Disconnected. Connection logs still available in browser console.', 'info');
+  };
+
+  // ── Download Connection Logs ────────────────────────────────────────────────
+  const downloadConnectionLogs = () => {
+    try {
+      const logs = sessionStorage.getItem('s3_connection_logs');
+      if (!logs) {
+        toast('No connection logs available', 'warn');
+        return;
+      }
+      
+      const parsedLogs = JSON.parse(logs);
+      const logText = parsedLogs.map(log => 
+        `[${log.timestamp}] [${log.level}] ${log.message} ${JSON.stringify(log)}`
+      ).join('\n');
+      
+      const blob = new Blob([logText], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `s3-connection-logs-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast(`Downloaded ${parsedLogs.length} log entries`, 'success');
+    } catch (e) {
+      console.error('Failed to download logs:', e);
+      toast('Failed to download logs', 'error');
+    }
+  };
 
   // ── List all objects ────────────────────────────────────────────────────────
   const listObjects = async (client, pfx) => {
@@ -600,6 +800,37 @@ const S3ObjectStorage = () => {
         </Modal>
       )}
 
+      {/* Manage Connections Modal */}
+      {modal?.type === 'connections' && (
+        <Modal title="Saved Connections" onClose={() => setModal(null)}>
+          <div style={{ maxHeight: 400, overflowY: 'auto', marginBottom: 16 }}>
+            {savedConnections.length === 0 ? (
+              <p style={{ fontSize: 13, color: 'var(--text-muted)', textAlign: 'center', padding: 20 }}>No saved connections yet</p>
+            ) : (
+              <div style={{ border: '1px solid var(--border)', borderRadius: 6 }}>
+                {savedConnections.map((conn, i) => (
+                  <div key={conn.id} style={{ padding: 12, borderBottom: i < savedConnections.length - 1 ? '1px solid var(--border)' : 'none', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{conn.name}</div>
+                      <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+                        {conn.bucketName} @ {new URL(conn.endpoint).hostname}
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button className="btn btn-primary" style={{ padding: '4px 12px', fontSize: 11 }} onClick={() => { loadConnection(conn.id); setShowNewConnectionForm(true); setModal(null); }}>Load</button>
+                      <button className="btn btn-danger" style={{ padding: '4px 12px', fontSize: 11 }} onClick={() => deleteConnection(conn.id)}>Delete</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <button className="btn btn-ghost" onClick={() => setModal(null)}>Close</button>
+          </div>
+        </Modal>
+      )}
+
       {/* ── Main Layout ── */}
       <div style={{ minHeight: '100vh', background: 'var(--bg)', padding: '0' }}>
         {/* Header */}
@@ -614,10 +845,133 @@ const S3ObjectStorage = () => {
         </div>
 
         <div style={{ maxWidth: 1100, margin: '0 auto', padding: '24px 16px' }}>
-          {/* Config Panel */}
-          {!connected && (
-            <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: 24, marginBottom: 24, animation: 'fadeUp 0.3s ease' }}>
-              <div style={{ fontSize: 11, color: 'var(--accent)', fontWeight: 600, letterSpacing: 2, textTransform: 'uppercase', marginBottom: 16 }}>Connection</div>
+          {/* Landing Page - Show Saved Connections */}
+          {!connected && !showNewConnectionForm && (
+            <div style={{ animation: 'fadeUp 0.3s ease' }}>
+              <div style={{ textAlign: 'center', marginBottom: 48 }}>
+                <div style={{ fontSize: 32, fontWeight: 700, color: 'var(--accent)', marginBottom: 8, fontFamily: 'var(--font-display)' }}>Connections</div>
+                <div style={{ fontSize: 14, color: 'var(--text-muted)' }}>
+                  {savedConnections.length === 0 
+                    ? 'Create your first S3 connection' 
+                    : `${savedConnections.length} saved connection${savedConnections.length !== 1 ? 's' : ''}`}
+                </div>
+              </div>
+
+              {/* Saved Connections Grid */}
+              {savedConnections.length > 0 && (
+                <div style={{ marginBottom: 48 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 16 }}>
+                    {savedConnections.map(conn => (
+                      <div 
+                        key={conn.id} 
+                        style={{ 
+                          background: 'var(--surface)', 
+                          border: '1px solid var(--border)', 
+                          borderRadius: 10, 
+                          padding: 20,
+                          cursor: 'pointer',
+                          transition: 'all 0.2s ease',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: 12
+                        }}
+                        onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--accent)'}
+                        onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--border)'}
+                      >
+                        <div>
+                          <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text)', marginBottom: 6 }}>{conn.name}</div>
+                          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 3 }}>📦 {conn.bucketName}</div>
+                          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>🌐 {new URL(conn.endpoint).hostname}</div>
+                          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>📍 {conn.region}</div>
+                        </div>
+                        <div style={{ display: 'flex', gap: 8, marginTop: 'auto' }}>
+                          <button 
+                            className="btn btn-primary" 
+                            onClick={() => { loadConnection(conn.id); setShowNewConnectionForm(true); }}
+                            style={{ flex: 1 }}
+                          >
+                            <Icon d={icons.connect} size={12} />Connect
+                          </button>
+                          <button 
+                            className="btn btn-ghost" 
+                            onClick={() => deleteConnection(conn.id)}
+                            style={{ padding: '7px 10px' }}
+                          >
+                            <Icon d={icons.trash} size={12} />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                    
+                    {/* Add New Connection Card */}
+                    <div 
+                      style={{ 
+                        background: 'rgba(77,255,180,0.1)', 
+                        border: '2px dashed var(--accent)', 
+                        borderRadius: 10, 
+                        padding: 20,
+                        cursor: 'pointer',
+                        transition: 'all 0.2s ease',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        minHeight: 180,
+                        gap: 12
+                      }}
+                      onClick={() => { 
+                        setConfig({ endpoint: '', bucketName: '', accessKey: '', secretKey: '', region: 'us-east-1' });
+                        setConnectionName('');
+                        setConnectionError(null);
+                        setFieldErrors({});
+                        setShowNewConnectionForm(true);
+                      }}
+                      onMouseEnter={e => e.currentTarget.style.background = 'rgba(77,255,180,0.15)'}
+                      onMouseLeave={e => e.currentTarget.style.background = 'rgba(77,255,180,0.1)'}
+                    >
+                      <div style={{ fontSize: 40, color: 'var(--accent)' }}>+</div>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--accent)' }}>New Connection</div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* No Connections - Show Add Button */}
+              {savedConnections.length === 0 && (
+                <div style={{ display: 'flex', justifyContent: 'center' }}>
+                  <button 
+                    className="btn btn-primary"
+                    onClick={() => { 
+                      setConfig({ endpoint: '', bucketName: '', accessKey: '', secretKey: '', region: 'us-east-1' });
+                      setConnectionName('');
+                      setConnectionError(null);
+                      setFieldErrors({});
+                      setShowNewConnectionForm(true);
+                    }}
+                    style={{ padding: '12px 32px', fontSize: 14, height: 'auto' }}
+                  >
+                    <Icon d={icons.folderPlus} size={16} />Create New Connection
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Config Panel - Show New Connection Form */}
+          {!connected && showNewConnectionForm && (
+            <div style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 10, padding: 24, marginBottom: 24, animation: 'fadeUp 0.3s ease', maxWidth: 600, margin: '0 auto' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
+                <button 
+                  onClick={() => setShowNewConnectionForm(false)}
+                  style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: 4, fontSize: 20 }}
+                >
+                  ←
+                </button>
+                <div>
+                  <div style={{ fontSize: 11, color: 'var(--accent)', fontWeight: 600, letterSpacing: 2, textTransform: 'uppercase' }}>New Connection</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>Enter your S3 credentials</div>
+                </div>
+              </div>
               
               {connectionError && (
                 <div style={{ background: '#3d1a1a', border: '1px solid #5a1a1a', color: '#ff6b6b', borderRadius: 8, padding: 12, marginBottom: 16, fontSize: 13 }}>
@@ -628,17 +982,20 @@ const S3ObjectStorage = () => {
               
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
                 {[
-                  { name: 'endpoint', label: 'Endpoint URL', placeholder: 'https://s3.example.com', type: 'text' },
-                  { name: 'bucketName', label: 'Bucket Name', placeholder: 'my-bucket', type: 'text' },
-                  { name: 'accessKey', label: 'Access Key', placeholder: 'AKIAIOSFODNN7EXAMPLE', type: 'text' },
-                  { name: 'secretKey', label: 'Secret Key', placeholder: '••••••••••••••••', type: 'password' },
-                  { name: 'region', label: 'Region', placeholder: 'us-east-1', type: 'text' },
+                  { name: 'endpoint', label: 'Endpoint URL', placeholder: 'https://s3.example.com', type: 'text', hint: 'S3-compatible endpoint (e.g., https://s3.amazonaws.com)' },
+                  { name: 'bucketName', label: 'Bucket Name', placeholder: 'my-bucket', type: 'text', hint: 'Name of the S3 bucket to access' },
+                  { name: 'accessKey', label: 'Access Key', placeholder: 'AKIAIOSFODNN7EXAMPLE', type: 'text', hint: 'AWS access key ID or equivalent' },
+                  { name: 'secretKey', label: 'Secret Key', placeholder: '••••••••••••••••', type: 'password', hint: 'Keep this secret! Not stored on server.' },
+                  { name: 'region', label: 'Region', placeholder: 'us-east-1', type: 'text', hint: 'AWS region (e.g., us-west-2, eu-west-1)' },
                 ].map(f => (
                   <div key={f.name} style={f.name === 'endpoint' ? { gridColumn: '1/-1' } : {}}>
                     <div style={{ fontSize: 11, color: fieldErrors[f.name] ? '#ff6b6b' : 'var(--text-muted)', marginBottom: 5, textTransform: 'uppercase', letterSpacing: 1 }}>
                       {f.label}
                       {fieldErrors[f.name] && <span style={{ marginLeft: 8, color: '#ff6b6b' }}>⚠ {fieldErrors[f.name]}</span>}
                     </div>
+                    {!fieldErrors[f.name] && f.hint && (
+                      <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6, fontStyle: 'italic' }}>💡 {f.hint}</div>
+                    )}
                     <input 
                       className="input" 
                       type={f.type} 
@@ -656,10 +1013,34 @@ const S3ObjectStorage = () => {
                   </div>
                 ))}
               </div>
-              <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
-                <button className="btn btn-primary" onClick={connectToS3} disabled={loading}>
-                  <Icon d={icons.connect} size={14} />{loading ? 'Connecting…' : 'Connect'}
-                </button>
+
+              {/* Save & Connect Buttons */}
+              <div style={{ marginTop: 20, paddingTop: 16, borderTop: '1px solid var(--border)' }}>
+                <div style={{ marginBottom: 12 }}>
+                  <label style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8, display: 'block' }}>Save This Connection (optional)</label>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input 
+                      className="input" 
+                      placeholder="Connection name (e.g., Production, Staging)" 
+                      value={connectionName}
+                      onChange={e => setConnectionName(e.target.value)}
+                      onKeyDown={e => e.key === 'Enter' && saveConnection()}
+                      style={{ flex: 1 }}
+                    />
+                    <button className="btn btn-ghost" onClick={saveConnection}>Save</button>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button className="btn btn-ghost" onClick={() => setShowNewConnectionForm(false)} style={{ flex: 1 }}>Cancel</button>
+                  <button className="btn btn-primary" onClick={connectToS3} disabled={loading} style={{ flex: 1 }}>
+                    <Icon d={icons.connect} size={14} />{loading ? 'Connecting…' : 'Connect'}
+                  </button>
+                </div>
+                <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
+                  <button className="btn btn-ghost" onClick={downloadConnectionLogs} style={{ flex: 1, fontSize: 11 }}>
+                    <Icon d={icons.download} size={12} />Download Connection Logs
+                  </button>
+                </div>
               </div>
             </div>
           )}
@@ -694,7 +1075,8 @@ const S3ObjectStorage = () => {
                   </button>
                 )}
                 <button className="btn btn-ghost" onClick={() => listObjects(null, prefix)} disabled={loading}><Icon d={icons.refresh} size={14} /></button>
-                <button className="btn btn-ghost" style={{ borderColor: '#c0392b', color: '#c0392b' }} onClick={disconnect}><Icon d={icons.disconnect} size={14} color="#c0392b" />Disconnect</button>
+                <button className="btn btn-ghost" style={{ borderColor: '#c0392b', color: '#c0392b' }} onClick={disconnect}><Icon d={icons.disconnect} size={14} color="#c0392b" />Switch Connection</button>
+                <button className="btn btn-ghost" onClick={downloadConnectionLogs}><Icon d={icons.download} size={14} />Download Logs</button>
               </div>
 
               {/* Upload Progress */}
